@@ -72,6 +72,19 @@ void ModFnDoubleWidth(digit_t* dest, const digit_t* src, uint32_t len) {
   ModFn(dest, len);
 }
 
+// Sets {result} := {a} - {b} mod F_n.
+void SubModFn(digit_t* result, const digit_t* a, const digit_t* b,
+              uint32_t len) {
+  digit_t borrow = 0;
+  for (uint32_t i = 0; i < len; i++) {
+    // Read both values first, because inputs and outputs can overlap.
+    digit_t ai = a[i];
+    digit_t bi = b[i];
+    result[i] = digit_sub2(ai, bi, borrow, &borrow);
+  }
+  ModFn(result, len);
+}
+
 // Sets {sum} := {a} + {b} and {diff} := {a} - {b}, which is more efficient
 // than computing sum and difference separately. Applies "mod F_n" normalization
 // to both results.
@@ -92,7 +105,7 @@ void SumDiff(digit_t* sum, digit_t* diff, const digit_t* a, const digit_t* b,
 
 // {result} := ({input} << shift) mod F_n, where shift >= K.
 void ShiftModFn_Large(digit_t* result, const digit_t* input,
-                      uint32_t digit_shift, int bits_shift, uint32_t K) {
+                      uint32_t digit_shift, uint32_t bits_shift, uint32_t K) {
   // If {digit_shift} is greater than K, we use the following transformation
   // (where, since everything is mod 2^K + 1, we are allowed to add or
   // subtract any multiple of 2^K + 1 at any time):
@@ -178,7 +191,7 @@ void ShiftModFn_Large(digit_t* result, const digit_t* input,
 
 // Sets {result} := {input} * 2^{power_of_two} mod 2^{K} + 1.
 // This function is highly relevant for overall performance.
-void ShiftModFn(digit_t* result, const digit_t* input, int power_of_two,
+void ShiftModFn(digit_t* result, const digit_t* input, uint32_t power_of_two,
                 uint32_t K, uint32_t zero_above = 0x7FFFFFFF) {
   // The modulo-reduction amounts to a subtraction, which we combine
   // with the shift as follows:
@@ -187,7 +200,7 @@ void ShiftModFn(digit_t* result, const digit_t* input, int power_of_two,
   //            -                  [ iK ] .... [ iX ]
   // where "X" is the index "K - digit_shift".
   uint32_t digit_shift = power_of_two / kDigitBits;
-  int bits_shift = power_of_two % kDigitBits;
+  uint32_t bits_shift = power_of_two % kDigitBits;
   // By an analogous construction to the "digit_shift >= K" case,
   // it turns out that:
   //    x * 2^{2K+m} == x * 2^m   mod 2^K + 1.
@@ -283,6 +296,37 @@ void ShiftModFn(digit_t* result, const digit_t* input, int power_of_two,
   }
 }
 
+// Weights are the multipliers that the FFT and the weighting steps apply,
+// stored as one integer {w} in "half exponent" units, meaning
+// sigma^(w & 1) * 2^(w >> 1), where
+//     sigma := 2^(3K/4) - 2^(K/4)   (mod 2^K + 1)
+// is a square root of 2, because 2^K == -1 makes 2^(3K/2) == -2^(K/2). Since
+// sigma^2 == 2, weights multiply by adding their {w}s, which is all the FFT
+// needs; it gives the n-th root of unity one extra factor of two per K.
+static_assert(kDigitBits % 4 == 0,
+              "the sqrt(2) trick requires kDigitBits to be a multiple of 4");
+
+// Sets {result} := {input} * sigma^(w & 1) * 2^(w >> 1) mod 2^K + 1.
+// {scratch} must have room for K + 1 digits, and must not alias {input} or
+// {result}; it is only used when the weight has an odd {w}.
+void MulByWeight(digit_t* result, const digit_t* input, uint32_t w, uint32_t K,
+                 digit_t* scratch, uint32_t zero_above = 0x7FFFFFFF) {
+  DCHECK(result != input);
+  uint32_t shift = w >> 1;
+  if ((w & 1) == 0) {
+    ShiftModFn(result, input, shift, K, zero_above);
+    return;
+  }
+  // sigma * 2^shift == 2^(shift + 3K/4) - 2^(shift + K/4) mod 2^K + 1.
+  // Both terms are ordinary modular shifts, and ShiftModFn is exact for
+  // arbitrarily large shift amounts.
+  const uint32_t quarter = K * (kDigitBits / 4);
+  DCHECK(scratch != input && scratch != result);
+  ShiftModFn(result, input, shift + 3 * quarter, K, zero_above);
+  ShiftModFn(scratch, input, shift + quarter, K, zero_above);
+  SubModFn(result, result, scratch, K + 1);
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Part 2: FFT-based multiplication is very sensitive to appropriate choice
 // of parameters. The following functions choose the parameters that the
@@ -296,20 +340,29 @@ struct Parameters {
   uint32_t K{0};
   uint32_t n{0};
   uint32_t s{0};
+  // The primitive n-th root of unity omega, in half exponent units:
+  // omega == sigma^(r & 1) * 2^(r >> 1). See {MulByWeight}.
   int r{0};
 };
 
-// Computes parameters for the main calculation, given a bit length {N} and
-// an {m}. See the paper for details.
-void ComputeParameters(uint32_t N, int m, Parameters* params) {
+// Computes parameters for the main calculation, given a bit length {N} and an
+// {m}. See the paper for details.
+// With {sqrt2_rounding}, K is rounded up to a multiple of n/4 instead of n/2.
+// The extra factor of two comes from sigma (see {MulByWeight}), so the root is
+// sigma^r; it is a plain power of two exactly when r is even. {r} is always
+// expressed in half exponent units.
+void ComputeParameters(uint32_t N, int m, Parameters* params,
+                       bool sqrt2_rounding) {
   N *= kDigitBits;
   uint32_t n = 1 << m;  // 2^m
-  uint32_t nhalf = n >> 1;
+  // {r} counts quarter blocks; m < 2 only happens in heuristic calls.
+  uint32_t quarter = std::max<uint32_t>(1, n >> 2);
+  uint32_t granularity = sqrt2_rounding ? quarter : (n >> 1);
   uint32_t s = (N + n - 1) >> m;  // ceil(N/n)
   s = RoundUp(s, kDigitBits);
-  uint32_t K = m + 2 * s + 1;  // K must be at least this big...
-  K = RoundUp(K, nhalf);       // ...and a multiple of n/2.
-  uint32_t r = K >> (m - 1);   // Which multiple?
+  uint32_t K = m + 2 * s + 1;   // K must be at least this big...
+  K = RoundUp(K, granularity);  // ...and a multiple of n/4 (or n/2).
+  uint32_t r = K / quarter;     // Which multiple, in half exponent units?
 
   // We want recursive calls to make progress, so force K to be a multiple
   // of 8 if it's above the recursion threshold. Otherwise, K must be a
@@ -319,8 +372,9 @@ void ComputeParameters(uint32_t N, int m, Parameters* params) {
                             : kLog2DigitBits;
   int K_tz = CountTrailingZeros(K);
   while (K_tz < threshold) {
+    // Every increment stays a multiple of the rounding granularity.
     K += (1u << K_tz);
-    r = K >> (m - 1);
+    r = K / quarter;
     K_tz = CountTrailingZeros(K);
   }
 
@@ -338,15 +392,19 @@ void ComputeParameters_Inner(uint32_t N, Parameters* params) {
   int N_bits = BitLength(N);
   int m = N_bits - 4;  // Don't let s get too small.
   m = std::min(max_m, m);
+  // Callers only recurse for K divisible by 4 and at least 200 digits, so
+  // {m} is at least 2. Guard {n >> 1} and the shift below against a future
+  // caller.
+  DCHECK(m > 0);
   N *= kDigitBits;
   uint32_t n = 1 << m;  // 2^m
   // We can't round up s in the inner layer, because N = n*s is fixed.
   uint32_t s = N >> m;
   DCHECK(N == s * n);
   uint32_t K = m + 2 * s + 1;  // K must be at least this big...
-  K = RoundUp(K, n);           // ...and a multiple of n and kDigitBits.
+  K = RoundUp(K, n >> 1);      // ...and a multiple of n/2 and kDigitBits.
   K = RoundUp(K, kDigitBits);
-  params->r = K >> m;  // Which multiple?
+  params->r = K >> (m - 1);  // Which multiple?
   DCHECK(K % kDigitBits == 0);
   DCHECK(s % kDigitBits == 0);
   params->K = K / kDigitBits;
@@ -355,6 +413,8 @@ void ComputeParameters_Inner(uint32_t N, Parameters* params) {
   params->m = m;
 }
 
+// Returns the inner layer's K, in digits, for an input of {N} digits. Callers
+// use it as a proxy for the inner layer's chunk size.
 uint32_t PredictInnerK(uint32_t N) {
   Parameters params;
   ComputeParameters_Inner(N, &params);
@@ -403,13 +463,16 @@ int GetParameters(uint32_t N, Parameters* params) {
   int max_m = N_bits - 3;                   // Larger m make s too small.
   max_m = std::max(kLog2DigitBits, max_m);  // Smaller m break the logic below.
   int m = max_m;
+  // The heuristics below were tuned against K values rounded to a multiple of
+  // n/2, so that is what they get to see; giving them the smaller sqrt(2) K
+  // values changes their m decisions in ways they were never tuned for.
   Parameters current;
-  ComputeParameters(N, m, &current);
+  ComputeParameters(N, m, &current, false);
   Parameters next;
-  ComputeParameters(N, m - 1, &next);
+  ComputeParameters(N, m - 1, &next, false);
   while (m > 2) {
     Parameters after_next;
-    ComputeParameters(N, m - 2, &after_next);
+    ComputeParameters(N, m - 2, &after_next, false);
     if (ShouldDecrementM(current, next, after_next)) {
       m--;
       current = next;
@@ -418,7 +481,32 @@ int GetParameters(uint32_t N, Parameters* params) {
       break;
     }
   }
-  *params = current;
+  // Take the finer rounding only when it is a clear win. {fine.K} and
+  // {current.K} count digits. The finer rounding saves a multiple of the
+  // n/4-bit block: on 64-bit targets that is n/256 digits, and n/128 on
+  // 32-bit targets, so at n = 256 one block is 64 bits, a single 64-bit
+  // digit (two 32-bit digits), which does not pay for the extra sigma
+  // multiplications. Requiring a saving of at least two digits rejects
+  // that case. The change must also not make the recursive layer's chunk
+  // size any bigger.
+  Parameters fine;
+  ComputeParameters(N, m, &fine, true);
+  // {PredictInnerK} is a proxy for the inner chunk size. Only compare the two
+  // candidates when both would actually recurse (above {kFftInnerThreshold},
+  // {ComputeParameters} already forces {K} to be a multiple of 8); otherwise
+  // the default keeps the comparison from rejecting a candidate for an
+  // unrelated reason.
+  bool inner_ok = true;
+  if (fine.K + 1 >= config::kFftInnerThreshold &&
+      current.K + 1 >= config::kFftInnerThreshold) {
+    DCHECK((fine.K & 3) == 0 && (current.K & 3) == 0);
+    inner_ok = PredictInnerK(fine.K) <= PredictInnerK(current.K);
+  }
+  if (fine.K + 2 <= current.K && inner_ok) {
+    *params = fine;
+  } else {
+    *params = current;
+  }
   return m;
 }
 
@@ -494,9 +582,10 @@ void FFTContainer::Start_Default(Digits X, uint32_t chunk_size, int theta,
   uint32_t len = X.len();
   const digit_t* pointer = X.digits();
   const size_t part_length_in_bytes = length_ * sizeof(digit_t);
-  int current_theta = 0;
+  uint32_t current_theta = 0;
   uint32_t i = 0;
-  for (; i < n_ && len > 0; i++, current_theta += theta) {
+  for (; i < n_ && len > 0;
+       i++, current_theta += static_cast<uint32_t>(theta)) {
     chunk_size = std::min(chunk_size, len);
     // For invocations via MultiplyFFT_Inner, X.len() == n_ * chunk_size + 1,
     // because the outer layer's "K" is passed as the inner layer's "N".
@@ -510,9 +599,9 @@ void FFTContainer::Start_Default(Digits X, uint32_t chunk_size, int theta,
     }
     if (current_theta != 0) {
       // Multiply with theta^i, and reduce modulo 2^K + 1.
-      // We pass theta as a shift amount; it really means 2^theta.
       CopyAndZeroExtend(temp(), pointer, chunk_size, part_length_in_bytes);
-      ShiftModFn(part_[i], temp(), current_theta, K_, chunk_size);
+      MulByWeight(part_[i], temp(), current_theta, K_, temp() + length_,
+                  chunk_size);
     } else {
       CopyAndZeroExtend(part_[i], pointer, chunk_size, part_length_in_bytes);
     }
@@ -547,8 +636,8 @@ void FFTContainer::Start(Digits X, uint32_t chunk_size, int theta, int omega) {
   for (; i < nhalf && len > 0; i++) {
     chunk_size = std::min(chunk_size, len);
     CopyAndZeroExtend(part_[i], pointer, chunk_size, part_length_in_bytes);
-    int w = omega * i;
-    ShiftModFn(part_[i + nhalf], part_[i], w, K_, chunk_size);
+    uint32_t w = static_cast<uint32_t>(omega) * i;
+    MulByWeight(part_[i + nhalf], part_[i], w, K_, temp(), chunk_size);
     pointer += chunk_size;
     len -= chunk_size;
   }
@@ -572,8 +661,10 @@ void FFTContainer::FFT_ReturnShuffledThreadsafe(uint32_t start, uint32_t len,
   for (uint32_t k = 1; k < half; k++) {
     SumDiff(part_[start + k], temp, part_[start + k], part_[start + half + k],
             length_);
-    int w = omega * k;
-    ShiftModFn(part_[start + half + k], temp, w, K_);
+    uint32_t w = static_cast<uint32_t>(omega) * k;
+    // {temp} has room for 2 * length_ digits, so its second half is free
+    // scratch space for weights that need the sigma treatment.
+    MulByWeight(part_[start + half + k], temp, w, K_, temp + length_);
   }
   FFT_Recurse(start, half, omega, temp);
 }
@@ -607,8 +698,8 @@ void FFTContainer::BackwardFFT_Threadsafe(uint32_t start, uint32_t len,
   SumDiff(part_[start], part_[start + half], part_[start], part_[start + half],
           length_);
   for (uint32_t k = 1; k < half; k++) {
-    int w = omega * (len - k);
-    ShiftModFn(temp, part_[start + half + k], w, K_);
+    uint32_t w = static_cast<uint32_t>(omega) * (len - k);
+    MulByWeight(temp, part_[start + half + k], w, K_, temp + length_);
     SumDiff(part_[start + k], part_[start + half + k], part_[start + k], temp,
             length_);
   }
@@ -619,10 +710,13 @@ void FFTContainer::NormalizeAndRecombine(int omega, int m, RWDigits Z,
                                          uint32_t chunk_size) {
   Z.Clear();
   uint32_t z_index = 0;
-  const int shift = n_ * omega - m;
+  const int64_t shift_signed =
+      static_cast<int64_t>(n_) * omega - 2 * static_cast<int64_t>(m);
+  DCHECK(shift_signed >= 0);
+  const uint32_t shift = static_cast<uint32_t>(shift_signed);
   for (uint32_t i = 0; i < n_; i++, z_index += chunk_size) {
     digit_t* part = part_[i];
-    ShiftModFn(temp(), part, shift, K_);
+    MulByWeight(temp(), part, shift, K_, temp() + length_);
     digit_t carry = 0;
     uint32_t zi = z_index;
     uint32_t j = 0;
@@ -632,7 +726,10 @@ void FFTContainer::NormalizeAndRecombine(int omega, int m, RWDigits Z,
     for (; j < length_; j++) {
       DCHECK(temp_[j] == 0);
     }
-    if (carry != 0) {
+    // The product fits in {Z}, so a correct recombination has no carry here.
+    // Keep the write in bounds in release builds, like the writes in
+    // {CounterWeightAndRecombine}, so a bad part cannot corrupt memory.
+    if (carry != 0 && zi < Z.len()) {
       Z[zi] = carry;
     }
   }
@@ -656,11 +753,14 @@ void FFTContainer::CounterWeightAndRecombine(int theta, int m, RWDigits Z,
   Z.Clear();
   uint32_t z_index = 0;
   for (uint32_t k = 0; k < n_; k++, z_index += s) {
-    int shift = -theta * k - m;
-    if (shift < 0) shift += 2 * n_ * theta;
+    int64_t shift =
+        -static_cast<int64_t>(theta) * k - 2 * static_cast<int64_t>(m);
+    if (shift < 0) shift += 2 * static_cast<int64_t>(n_) * theta;
     DCHECK(shift >= 0);
+    DCHECK(shift <= UINT32_MAX);
     digit_t* input = part_[k];
-    ShiftModFn(temp(), input, shift, K_);
+    MulByWeight(temp(), input, static_cast<uint32_t>(shift), K_,
+                temp() + length_);
     uint32_t remaining_z = Z.len() - z_index;
     if (ShouldBeNegative(temp(), length_, k + 1, s)) {
       // Subtract F_n from input before adding to result. We use the following
@@ -707,8 +807,11 @@ void FFTContainer::CounterWeightAndRecombine(int theta, int m, RWDigits Z,
 // Main FFT function for recursive invocations ("inner layer").
 void MultiplyFFT_Inner(RWDigits Z, Digits X, Digits Y, const Parameters& params,
                        ProcessorImpl* processor) {
-  int omega = 2 * params.r;  // really: 2^(2r)
-  int theta = params.r;      // really: 2^r
+  // theta == sigma^(r & 1) * 2^(r >> 1) and omega == theta^2 == 2^r, a plain
+  // power of two, so all butterflies stay ordinary shifts; sigma only appears
+  // in the initial weighting and the counter-weighting step.
+  int omega = 2 * params.r;  // really: 2^r
+  int theta = params.r;      // really: 2^(r/2), times sigma if r is odd
 
   FFTContainer a(params.n, params.K, processor);
   a.Start_Default(X, params.s, theta, omega);
@@ -766,8 +869,10 @@ void FFTContainer::PointwiseMultiply(const FFTContainer& other) {
 // TODO(jkummerow): Consider doing a "Mersenne transform" and CRT reconstruction
 // of the final result. Might yield a few percent of perf improvement.
 
-// TODO(jkummerow): Consider implementing the "sqrt(2) trick".
-// Gaudry/Kruppa/Zimmerman report that it saved them around 10%.
+// The "sqrt(2) trick" (Gaudry/Kruppa/Zimmermann, ISSAC 2007, Section 2.4) is
+// implemented via {MulByWeight}: sigma doubles the root order available for a
+// given K, so both layers can round K up to a multiple of n/4 (outer) resp.
+// n/2 (inner) instead of n/2 resp. n.
 
 void ProcessorImpl::MultiplyFFT(RWDigits Z, Digits X, Digits Y) {
   // TODO(jkummerow): Determine a good threshold value. Earlier experiments
@@ -778,7 +883,7 @@ void ProcessorImpl::MultiplyFFT(RWDigits Z, Digits X, Digits Y) {
   if (X == Y) {
     // Squaring.
     int m = GetParameters(X.len() * 2, &params);
-    int omega = params.r;  // really: 2^r
+    int omega = params.r;  // In half exponent units; see {MulByWeight}.
     FFTContainer a(params.n, params.K, this);
     a.Start(X, params.s, 0, omega);
     a.PointwiseMultiply(a);
@@ -789,7 +894,7 @@ void ProcessorImpl::MultiplyFFT(RWDigits Z, Digits X, Digits Y) {
     // Asymmetric input sizes. Proceed in chunks. See {MultiplyToomCook()}.
     uint32_t k = Y.len();
     int m = GetParameters(k * 2, &params);
-    int omega = params.r;  // really: 2^r
+    int omega = params.r;  // In half exponent units; see {MulByWeight}.
     // The container {b} only needs to be initialized once, whereas {a} will
     // be reused for each chunk.
     FFTContainer b(params.n, params.K, this);
@@ -816,7 +921,7 @@ void ProcessorImpl::MultiplyFFT(RWDigits Z, Digits X, Digits Y) {
   } else {
     // Similar-ish sized inputs. Handle them in one go.
     int m = GetParameters(X.len() + Y.len(), &params);
-    int omega = params.r;  // really: 2^r
+    int omega = params.r;  // In half exponent units; see {MulByWeight}.
 
     FFTContainer a(params.n, params.K, this);
     a.Start(X, params.s, 0, omega);

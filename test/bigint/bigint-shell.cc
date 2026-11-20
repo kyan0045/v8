@@ -618,6 +618,59 @@ class Runner {
 
   void TestFFT(int* count) {
 #if V8_ADVANCED_BIGINT_ALGORITHMS
+    // Deterministic regression test for the sqrt(2) weights. For 6017 input
+    // digits the FFT uses (m, n, s, K, r) = (9, 512, 12, 26, 13) with 64-bit
+    // digits and (8, 256, 24, 50, 25) with 32-bit digits; both have 768-bit
+    // chunks. {Start} multiplies chunk 139 (64-bit) or 35 (32-bit) by
+    // omega^chunk = sigma * 2^shift, with shift 903 or 437. A single bit at
+    // offset 345 or 763 in that chunk makes the subtrahend in {MulByWeight}
+    // exactly 2^(K * kDigitBits), whose top word is 1. Ignoring that word in
+    // {SubModFn} changes the product.
+    {
+      constexpr uint32_t kLeft = 3009;
+      constexpr uint32_t kRight = 3008;
+      const bool wide = sizeof(digit_t) == 8;
+      const uint32_t chunk = wide ? 139 : 35;
+      const uint32_t bit_in_chunk = wide ? 345 : 763;
+      const uint32_t chunk_bits = (wide ? 12 : 24) * kDigitBits;
+      ScratchDigits A(kLeft, platform_);
+      ScratchDigits B(kRight, platform_);
+      for (uint32_t i = 0; i < kLeft; i++) A[i] = 0;
+      for (uint32_t i = 0; i < kRight; i++) {
+        B[i] = static_cast<digit_t>(0x9e3779b97f4a7c15ULL * (i + 1));
+      }
+      B[kRight - 1] = B[kRight - 1] | 1;
+      A[kLeft - 1] = 1;
+      uint32_t bit = chunk * chunk_bits + bit_in_chunk;
+      uint32_t index = bit / kDigitBits;
+      A[index] = A[index] ^ (digit_t{1} << (bit % kDigitBits));
+      uint32_t result_len = MultiplyResultLength(A, B);
+      ScratchDigits result(result_len, platform_);
+      ScratchDigits result_toom(result_len, platform_);
+      processor()->MultiplyFFT(result, A, B);
+      processor()->MultiplyToomCook(result_toom, A, B);
+      AssertEquals(A, B, result_toom, result);
+      if (error_) return;
+      (*count)++;
+    }
+    // Squaring takes the pointer-equal fast path. 3009 digits gives an odd
+    // root exponent on both digit widths, so the sigma weights are exercised.
+    {
+      constexpr uint32_t kSize = 3009;
+      ScratchDigits A(kSize, platform_);
+      for (uint32_t i = 0; i < kSize; i++) {
+        A[i] = static_cast<digit_t>(0x9e3779b97f4a7c15ULL * (i + 1));
+      }
+      A[kSize - 1] = A[kSize - 1] | 1;
+      uint32_t result_len = MultiplyResultLength(A, A);
+      ScratchDigits result(result_len, platform_);
+      ScratchDigits result_toom(result_len, platform_);
+      processor()->MultiplyFFT(result, A, A);
+      processor()->MultiplyToomCook(result_toom, A, A);
+      AssertEquals(A, A, result_toom, result);
+      if (error_) return;
+      (*count)++;
+    }
     // Larger multiplications are slower, so to keep individual runs fast,
     // we test a few random samples. With build bots running 24/7, we'll
     // get decent coverage over time.
